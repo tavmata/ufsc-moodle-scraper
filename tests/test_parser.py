@@ -10,6 +10,7 @@ from moodle_parser import (
     filename_from_headers_or_url,
     find_subpage_section_urls,
     is_login_page,
+    parse_book_chapter_content,
     parse_book_chapters,
     parse_courses_from_dashboard,
     parse_course_sections,
@@ -358,9 +359,11 @@ class CourseParsingTests(unittest.TestCase):
                 <a class="aalink" href="/mod/forum/view.php?id=88">
                   <span class="instancename">Atividade 1<span class="accesshide"> Fórum</span></span>
                 </a>
-                <div class="contentafterlink">
-                  <p>Poste sua resenha ate sexta-feira.</p>
-                  <iframe src="https://www.youtube.com/embed/abc123" title="Debate"></iframe>
+                <div class="description">
+                  <div class="contentafterlink">
+                    <p>Poste sua resenha ate sexta-feira.</p>
+                    <iframe src="https://www.youtube.com/embed/abc123" title="Debate"></iframe>
+                  </div>
                 </div>
               </li>
             </ul></div>
@@ -370,11 +373,26 @@ class CourseParsingTests(unittest.TestCase):
         sections = parse_course_sections(html, BASE_URL)
         self.assertEqual(len(sections), 1)
         self.assertIn("### Atividade 1", sections[0].summary_text)
-        self.assertIn("Poste sua resenha ate sexta-feira.", sections[0].summary_text)
+        self.assertEqual(sections[0].summary_text.count("Poste sua resenha ate sexta-feira."), 1)
         self.assertEqual(
             [(e.label, e.url) for e in sections[0].external_links],
             [("Debate", "https://www.youtube.com/embed/abc123")],
         )
+
+    def test_parse_book_chapter_content_excludes_outer_book_header_and_nav(self) -> None:
+        html = """
+        <html><body><section id="region-main">
+          <h2>Livro Principal</h2>
+          <div class="activity-description">Intro geral do livro</div>
+          <div role="main">
+            <div class="navtop"><a href="?id=30&amp;chapterid=2">Proximo</a></div>
+            <div class="book_content"><p>Texto exclusivo do capitulo 1.</p></div>
+            <div class="navbottom"><a href="?id=30&amp;chapterid=2">Proximo</a></div>
+          </div>
+        </section></body></html>
+        """
+        text, _, _ = parse_book_chapter_content(html, BASE_URL)
+        self.assertEqual(text, "Texto exclusivo do capitulo 1.")
 
 
 if __name__ == "__main__":

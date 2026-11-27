@@ -446,12 +446,16 @@ def parse_course_sections(html: str, base_url: str) -> list[SectionData]:
             act_title = _clean_element_text(name_el) or f"{mod_type}_{cmid}"
             details = _clean_element_text(act.select_one(".resourcelinkdetails"))
 
-            # Also inspect inline activity descriptions for links AND instruction notes.
+            # Inspect outermost inline activity description containers once for links and notes.
+            desc_candidates = act.select(".contentafterlink, .activity-description, .activity-altcontent, .description")
+            candidate_ids = {id(el) for el in desc_candidates}
             desc_parts: list[str] = []
-            for desc_el in act.select(".contentafterlink, .activity-description, .activity-altcontent, .description"):
+            for desc_el in desc_candidates:
+                if any(id(parent) in candidate_ids for parent in desc_el.parents):
+                    continue
                 add_links(desc_el)
                 desc_txt = _clean_element_text(desc_el)
-                if desc_txt and desc_txt != details:
+                if desc_txt and desc_txt != details and desc_txt not in desc_parts:
                     desc_parts.append(desc_txt)
             if desc_parts:
                 label_notes.append(f"### {act_title}\n" + "\n\n".join(desc_parts))
@@ -543,10 +547,14 @@ def parse_url_activity_target(html: str, base_url: str) -> str | None:
     return None
 
 
-def _clean_region_main(html: str, strip_selectors: tuple[str, ...] = ()) -> Tag:
-    """Return a cloned `#region-main` (falling back to `[role="main"]`) with chrome removed."""
+def _clean_region_main(
+    html: str,
+    root_selectors: tuple[str, ...] = ("section#region-main", "#region-main", "[role='main']"),
+    strip_selectors: tuple[str, ...] = (),
+) -> Tag:
+    """Return a cloned main content container matching `root_selectors` in priority order."""
     soup = BeautifulSoup(html, "lxml")
-    region = soup.select_one("section#region-main, #region-main, [role='main']") or soup
+    region = next((el for sel in root_selectors if (el := soup.select_one(sel)) is not None), soup)
     clone = BeautifulSoup(str(region), "lxml")
     root = (clone.body.find() if clone.body else None) or clone
     chrome_selectors = (
@@ -564,18 +572,39 @@ def _clean_region_main(html: str, strip_selectors: tuple[str, ...] = ()) -> Tag:
     return root
 
 
-def parse_page_or_assign_content(html: str, base_url: str) -> tuple[str, list[LinkItem], list[LinkItem]]:
-    """Extract readable text, prompts, dates, and linked files/URLs from `mod_page` or `mod_assign`."""
-    region = _clean_region_main(html)
+def _extract_region_bundle(
+    html: str,
+    base_url: str,
+    root_selectors: tuple[str, ...] = ("section#region-main", "#region-main", "[role='main']"),
+    strip_selectors: tuple[str, ...] = (),
+) -> tuple[str, list[LinkItem], list[LinkItem]]:
+    """Extract cleaned text and deduplicated links from a selected page region."""
+    region = _clean_region_main(html, root_selectors=root_selectors, strip_selectors=strip_selectors)
     text = _clean_element_text(region)
     p_links, e_links = extract_links_from_container(region, base_url)
     return text, p_links, e_links
 
 
+def parse_page_or_assign_content(html: str, base_url: str) -> tuple[str, list[LinkItem], list[LinkItem]]:
+    """Extract readable text, prompts, dates, and linked files/URLs from `mod_page` or `mod_assign`."""
+    return _extract_region_bundle(html, base_url)
+
+
+def parse_book_chapter_content(html: str, base_url: str) -> tuple[str, list[LinkItem], list[LinkItem]]:
+    """Extract a single `mod_book` chapter body without repeating book-level headers or TOC."""
+    return _extract_region_bundle(
+        html,
+        base_url,
+        root_selectors=(".book_content", "[role='main']", "section#region-main", "#region-main"),
+        strip_selectors=(".navtop", ".navbottom", ".book_toc", "#mod_book-chapters", ".block_book_toc"),
+    )
+
+
 def parse_folder_metadata(html: str, base_url: str) -> tuple[str, list[LinkItem], list[LinkItem]]:
     """Extract folder description text and non-tree links/attachments from `#region-main`."""
-    region = _clean_region_main(
+    text, p_links, e_links = _extract_region_bundle(
         html,
+        base_url,
         strip_selectors=(
             ".foldertree",
             "#folder_tree0",
@@ -584,8 +613,6 @@ def parse_folder_metadata(html: str, base_url: str) -> tuple[str, list[LinkItem]
             ".btn",
         ),
     )
-    text = _clean_element_text(region)
-    p_links, e_links = extract_links_from_container(region, base_url)
     p_links = [item for item in p_links if "/mod_folder/content/" not in item.url]
     return text, p_links, e_links
 

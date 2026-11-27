@@ -313,7 +313,7 @@ class EndToEndLoopbackMoodleTests(unittest.TestCase):
 
                 if parsed.path == "/mod/url/view.php" and qs.get("id") == ["50"]:
                     self.send_response(302)
-                    self.send_header("Location", f"http://localhost:{ext_server.server_port}/funag/public.pdf")
+                    self.send_header("Location", f"http://127.0.0.1:{ext_server.server_port}/funag/public.pdf")
                     self.end_headers()
                     return
 
@@ -321,7 +321,7 @@ class EndToEndLoopbackMoodleTests(unittest.TestCase):
                     html = f"""
                     <html><body><div role="main">
                       <div class="urlworkaround">
-                        Clique em <a href="http://localhost:{ext_server.server_port}/funag/wrapped.pdf">wrapped</a>
+                        Clique em <a href="http://127.0.0.1:{ext_server.server_port}/funag/wrapped.pdf">wrapped</a>
                       </div>
                     </div></body></html>
                     """.encode("utf-8")

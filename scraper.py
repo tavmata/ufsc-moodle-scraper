@@ -33,6 +33,7 @@ from moodle_parser import (
     filename_from_headers_or_url,
     find_subpage_section_urls,
     is_login_page,
+    parse_book_chapter_content,
     parse_book_chapters,
     parse_courses_from_dashboard,
     parse_course_sections,
@@ -718,7 +719,7 @@ def handle_book(
     targets = chapters or [(act.title, act.url)]
     for ch_title, ch_url in targets:
         ch_html = html if ch_url == act.url else fetch_html(ses, ch_url)[0]
-        ch_text, pluginfiles, externals = parse_page_or_assign_content(ch_html, cfg.base_url)
+        ch_text, pluginfiles, externals = parse_book_chapter_content(ch_html, cfg.base_url)
         sections_md.append(f"## {ch_title}\n\n{ch_text}")
         if externals:
             sections_md.append("\n".join(f"- [{l.label}]({l.url})" for l in externals))
