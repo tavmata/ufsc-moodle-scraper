@@ -1,0 +1,14 @@
+[scraper]
+baseurl = https://presencial.moodle.ufsc.br/
+root = ./downloads
+# Optional: paste your MoodleSession cookie value, or use `python scraper.py --login`
+moodle_session =
+# Comma-separated options: true/false
+dump_html = false
+save_notes = true
+save_url_files = true
+download_external_files = true
+include_pages = true
+include_books = true
+include_assigns = true
+

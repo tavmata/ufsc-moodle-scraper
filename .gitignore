@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+scraper.conf
+.session/
+downloads/
+.dump/
+*.part
+*.log
+
