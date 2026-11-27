@@ -28,13 +28,17 @@ from urllib3.util.retry import Retry
 from moodle_parser import (
     ActivityItem,
     CourseInfo,
+    InlineFolder,
     LinkItem,
     SectionData,
     filename_from_headers_or_url,
     find_subpage_section_urls,
+    extract_sesskey,
+    has_ufsc_course_list,
     is_login_page,
     parse_book_chapter_content,
     parse_book_chapters,
+    parse_courses_from_ajax_payload,
     parse_courses_from_dashboard,
     parse_course_sections,
     parse_folder_files,
@@ -63,7 +67,24 @@ DIRECT_FILE_EXTENSIONS = (
     ".zip",
     ".csv",
 )
-LEGACY_OFFICE_PAIRS = frozenset({("ppt", "pptx"), ("doc", "docx"), ("xls", "xlsx")})
+LEGACY_OFFICE_PAIRS = frozenset(
+    {
+        ("ppt", "pptx"),
+        ("pptx", "ppt"),
+        ("doc", "docx"),
+        ("docx", "doc"),
+        ("xls", "xlsx"),
+        ("xlsx", "xls"),
+    }
+)
+BINARY_MIME_PREFIXES = (
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.",
+    "application/vnd.ms-",
+    "application/epub+zip",
+    "application/zip",
+)
 
 
 @dataclass
@@ -122,11 +143,12 @@ def _fit_windows_path(dest_dir: Path, filename: str) -> Path:
 
 def _fit_subdir_path(base_dir: Path, parts: list[str], reserved_filename_chars: int = 45) -> Path:
     """Keep nested subfolder paths short enough so child filenames fit under MAX_WIN_PATH."""
-    if not parts:
+    filtered = [p for p in parts if p and p not in (".", "..", "/", "\\")]
+    if not filtered:
         return base_dir
 
     dir_budget = max(len(str(base_dir)) + 12, MAX_WIN_PATH - reserved_filename_chars)
-    clean_parts = [sanitize_name(p, max_length=50) for p in parts]
+    clean_parts = [sanitize_name(p, max_length=50) for p in filtered]
     candidate = base_dir.joinpath(*clean_parts)
     if len(str(candidate)) <= dir_budget:
         return candidate
@@ -137,6 +159,10 @@ def _fit_subdir_path(base_dir: Path, parts: list[str], reserved_filename_chars: 
         merged = sanitize_name(f"{shrunk[-2]}_{shrunk[-1]}", max_length=24)
         shrunk = [*shrunk[:-2], merged]
         candidate = base_dir.joinpath(*shrunk)
+    if len(shrunk) == 1 and len(str(candidate)) > dir_budget:
+        single_budget = max(8, dir_budget - len(str(base_dir)) - 1)
+        shrunk[0] = sanitize_name(shrunk[0], max_length=single_budget)
+        candidate = base_dir / shrunk[0]
     return candidate
 
 
@@ -273,8 +299,11 @@ def build_http_session(base_url: str, moodle_session: str = "") -> requests.Sess
             pass
 
     if moodle_session:
+        has_explicit_name = "=" in moodle_session
         for cookie_name, cookie_value in parse_cookie_pairs(moodle_session):
             ses.cookies.set(cookie_name, cookie_value, domain=host, path="/")
+            if not has_explicit_name and host == "presencial.moodle.ufsc.br" and cookie_name == "MoodleSession":
+                ses.cookies.set("MoodleSessionmdlpre", cookie_value, domain=host, path="/")
 
     return ses
 
@@ -296,7 +325,7 @@ def _launch_login_browser(playwright_ctx):
 
 
 def interactive_playwright_login(base_url: str, timeout_seconds: int = 300) -> str:
-    """Open Chromium/Chrome for manual UFSC SSO login and persist Moodle cookies locally."""
+    """Open Chromium/Chrome for manual SSO/Moodle login and persist Moodle cookies locally."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -307,8 +336,8 @@ def interactive_playwright_login(base_url: str, timeout_seconds: int = 300) -> s
     target = base_url.rstrip("/") + "/login/index.php"
     host = (urlparse(base_url).hostname or "").lower()
 
-    print(f"[auth] Opening browser for UFSC Moodle login: {target}")
-    print("[auth] Complete idUFSC / Moodle login in the opened browser window...")
+    print(f"[auth] Opening browser for Moodle login: {target}")
+    print("[auth] Complete SSO / Moodle login in the opened browser window...")
 
     with sync_playwright() as p:
         browser = _launch_login_browser(p)
@@ -316,10 +345,16 @@ def interactive_playwright_login(base_url: str, timeout_seconds: int = 300) -> s
         page = context.new_page()
         page.goto(target, wait_until="domcontentloaded")
 
-        # Poll safely across cross-origin idUFSC SSO redirects without breaking on navigation frames.
+        # Poll safely across cross-origin SSO redirects without breaking on navigation frames.
         deadline = time.monotonic() + timeout_seconds
         cookies: list[dict] = []
         while time.monotonic() < deadline:
+            if page.is_closed():
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                raise RuntimeError("Login browser was closed before login completed.")
             try:
                 parsed = urlparse(page.url)
                 path = parsed.path.lower()
@@ -333,12 +368,26 @@ def interactive_playwright_login(base_url: str, timeout_seconds: int = 300) -> s
             time.sleep(0.5)
         else:
             browser.close()
-            raise TimeoutError(f"Timed out after {timeout_seconds}s waiting for UFSC Moodle login.")
+            raise TimeoutError(f"Timed out after {timeout_seconds}s waiting for Moodle login.")
 
         page.wait_for_load_state("domcontentloaded")
         cookies = _matching_domain_cookies(context.cookies(), host)
-        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SESSION_FILE.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+        if cookies:
+            existing_cookies: list[dict] = []
+            if SESSION_FILE.exists():
+                try:
+                    loaded = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+                    if isinstance(loaded, list):
+                        existing_cookies = [
+                            c
+                            for c in loaded
+                            if isinstance(c, dict) and not _matching_domain_cookies([c], host)
+                        ]
+                except (OSError, json.JSONDecodeError):
+                    existing_cookies = []
+            merged_cookies = [*existing_cookies, *cookies]
+            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SESSION_FILE.write_text(json.dumps(merged_cookies, indent=2), encoding="utf-8")
         session_cookie = next(
             (c["value"] for c in cookies if c["name"].startswith("MoodleSession")),
             "",
@@ -384,6 +433,20 @@ def _disambiguate_path(dest_dir: Path, filename: str, stats: ScrapeStats) -> Pat
         idx += 1
 
 
+def _read_bounded_bytes(resp: requests.Response, max_bytes: int = 524288) -> bytes:
+    """Read up to `max_bytes` from a streaming response without consuming huge binaries."""
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=32768):
+        if not chunk:
+            continue
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= max_bytes:
+            break
+    return b"".join(chunks)
+
+
 def _stream_response_to_file(
     resp: requests.Response,
     dest_dir: Path,
@@ -391,6 +454,7 @@ def _stream_response_to_file(
     stats: ScrapeStats,
     preferred_name: str | None = None,
     prefix: str = "    ",
+    initial_bytes: bytes | None = None,
 ) -> None:
     """Stream an already-opened HTTP response to disk with skip and atomic rename."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -408,6 +472,8 @@ def _stream_response_to_file(
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
     try:
         with tmp_path.open("wb") as handle:
+            if initial_bytes:
+                handle.write(initial_bytes)
             for chunk in resp.iter_content(chunk_size=65536):
                 if chunk:
                     handle.write(chunk)
@@ -439,7 +505,23 @@ def download_binary(
         resp.raise_for_status()
         if is_login_page("", resp.url):
             raise PermissionError("Session expired while downloading file.")
-        _stream_response_to_file(resp, dest_dir, cfg, stats, preferred_name=preferred_name, prefix=prefix)
+        ctype = resp.headers.get("content-type", "").lower()
+        disp = resp.headers.get("content-disposition", "").lower()
+        initial_bytes: bytes | None = None
+        if "text/html" in ctype and "attachment" not in disp:
+            initial_bytes = _read_bounded_bytes(resp)
+            html_preview = initial_bytes.decode(resp.encoding or "utf-8", errors="replace")
+            if is_login_page(html_preview, resp.url):
+                raise PermissionError("Session expired while downloading file.")
+        _stream_response_to_file(
+            resp,
+            dest_dir,
+            cfg,
+            stats,
+            preferred_name=preferred_name,
+            prefix=prefix,
+            initial_bytes=initial_bytes,
+        )
 
 
 def write_text_file(
@@ -449,22 +531,25 @@ def write_text_file(
     stats: ScrapeStats,
     kind: str = "note",
     prefix: str = "    ",
-) -> None:
-    """Write UTF-8 text content if new or overwrite is enabled."""
+) -> Path:
+    """Write UTF-8 text content if new or overwrite is enabled, disambiguating collisions."""
+    resolved_path = _disambiguate_path(dest_path.parent, dest_path.name, stats)
+    stats.written_paths.add(resolved_path)
     if cfg.dry_run:
-        print(f"{prefix}[dry-run:{kind}] {dest_path.name}")
-        return
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    if dest_path.exists() and not cfg.overwrite:
-        print(f"{prefix}[skip] {dest_path.name}")
+        print(f"{prefix}[dry-run:{kind}] {resolved_path.name}")
+        return resolved_path
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    if resolved_path.exists() and not cfg.overwrite:
+        print(f"{prefix}[skip] {resolved_path.name}")
         stats.skipped += 1
-        return
-    dest_path.write_text(content, encoding="utf-8")
-    print(f"{prefix}[{kind}] {dest_path.name}")
+        return resolved_path
+    resolved_path.write_text(content, encoding="utf-8")
+    print(f"{prefix}[{kind}] {resolved_path.name}")
     if kind == "link":
         stats.links += 1
     else:
         stats.notes += 1
+    return resolved_path
 
 
 def handle_resource(
@@ -486,18 +571,28 @@ def handle_resource(
 
         ctype = resp.headers.get("content-type", "").lower()
         disp = resp.headers.get("content-disposition", "").lower()
-        if "pluginfile.php" not in resp.url and "text/html" in ctype and "attachment" not in disp:
-            html = resp.text
+        initial_bytes: bytes | None = None
+        if "text/html" in ctype and "attachment" not in disp:
+            initial_bytes = _read_bounded_bytes(resp)
+            html = initial_bytes.decode(resp.encoding or "utf-8", errors="replace")
             if is_login_page(html, resp.url):
                 raise PermissionError("Session expired while fetching resource.")
-            file_url = parse_resource_redirect_url(html, cfg.base_url)
-            if file_url:
-                download_binary(ses, file_url, sec_dir, cfg, stats, preferred_name=act.title)
+            if "pluginfile.php" not in resp.url:
+                file_url = parse_resource_redirect_url(html, cfg.base_url)
+                if file_url:
+                    download_binary(ses, file_url, sec_dir, cfg, stats, preferred_name=act.title)
+                    return
+                print(f"    [warn] No direct file link found in resource wrapper: {act.title}")
                 return
-            print(f"    [warn] No direct file link found in resource wrapper: {act.title}")
-            return
 
-        _stream_response_to_file(resp, sec_dir, cfg, stats, preferred_name=act.title)
+        _stream_response_to_file(
+            resp,
+            sec_dir,
+            cfg,
+            stats,
+            preferred_name=act.title,
+            initial_bytes=initial_bytes,
+        )
 
 
 def handle_folder(
@@ -511,17 +606,29 @@ def handle_folder(
     html, _ = fetch_html(ses, act.url)
     files = parse_folder_files(html, cfg.base_url)
     folder_text, extra_plugins, extra_externals = parse_folder_metadata(html, cfg.base_url)
-    folder_dir = sec_dir / sanitize_name(act.title, max_length=70, fallback=f"folder_{act.cmid}")
+    folder_dir = _fit_subdir_path(sec_dir, [act.title or f"folder_{act.cmid}"], reserved_filename_chars=55)
     print(f"    +-- [folder] {folder_dir.name} ({len(files)} files)")
 
     for rel_path, file_url in files:
         parts = list(Path(rel_path).parts[:-1])
         target_dir = _fit_subdir_path(folder_dir, parts)
         fname = Path(rel_path).name
-        download_binary(ses, file_url, target_dir, cfg, stats, preferred_name=fname, prefix="        ")
+        try:
+            download_binary(ses, file_url, target_dir, cfg, stats, preferred_name=fname, prefix="        ")
+        except PermissionError:
+            raise
+        except Exception as exc:
+            print(f"        [error] {fname}: {exc}")
+            stats.errors += 1
 
     for pfile in extra_plugins:
-        download_binary(ses, pfile.url, folder_dir, cfg, stats, prefix="        ")
+        try:
+            download_binary(ses, pfile.url, folder_dir, cfg, stats, prefix="        ")
+        except PermissionError:
+            raise
+        except Exception as exc:
+            print(f"        [error] {pfile.url}: {exc}")
+            stats.errors += 1
 
     has_meaningful_text = bool(folder_text and folder_text.casefold() != act.title.casefold())
     if cfg.save_notes and (has_meaningful_text or extra_externals):
@@ -542,17 +649,9 @@ def handle_folder(
 
 def _read_bounded_html(resp: requests.Response, max_bytes: int = 524288) -> str:
     """Read up to `max_bytes` from a streaming HTML response without downloading huge binaries."""
-    chunks: list[bytes] = []
-    total = 0
-    for chunk in resp.iter_content(chunk_size=32768):
-        if not chunk:
-            continue
-        chunks.append(chunk)
-        total += len(chunk)
-        if total >= max_bytes:
-            break
+    raw = _read_bounded_bytes(resp, max_bytes=max_bytes)
     encoding = resp.encoding or "utf-8"
-    return b"".join(chunks).decode(encoding, errors="replace")
+    return raw.decode(encoding, errors="replace")
 
 
 def _is_direct_binary_response(url: str, headers: dict[str, str] | requests.structures.CaseInsensitiveDict) -> bool:
@@ -561,7 +660,7 @@ def _is_direct_binary_response(url: str, headers: dict[str, str] | requests.stru
     disp = headers.get("content-disposition", "").lower()
     if "text/html" in ctype and "attachment" not in disp:
         return False
-    if "application/pdf" in ctype or "attachment" in disp:
+    if "attachment" in disp or any(prefix in ctype for prefix in BINARY_MIME_PREFIXES):
         return True
     return urlparse(url).path.lower().endswith(DIRECT_FILE_EXTENSIONS)
 
@@ -644,6 +743,10 @@ def handle_url(
     already_saved = False
     try:
         resp, resolved_url = _fetch_url_within_host(ses, act.url, base_host)
+        if is_login_page("", resolved_url):
+            if resp is not None:
+                resp.close()
+            raise PermissionError("Session expired while resolving URL activity.")
         target_url = resolved_url
         if resp is not None:
             with resp:
@@ -655,6 +758,8 @@ def handle_url(
                         raise PermissionError("Session expired while resolving URL activity.")
                     extracted = parse_url_activity_target(html, cfg.base_url)
                     if extracted:
+                        if is_login_page("", extracted):
+                            raise PermissionError("Session expired while resolving URL activity.")
                         target_url = extracted
                 elif cfg.download_external_files and _is_direct_binary_response(resp.url, resp.headers):
                     _stream_response_to_file(resp, sec_dir, cfg, stats, preferred_name=act.title)
@@ -663,8 +768,11 @@ def handle_url(
         pass
 
     target_host = urlparse(target_url).netloc.lower()
-    if cfg.download_external_files and not already_saved and target_host and target_host != base_host:
-        _download_external_target_file(target_url, sec_dir, cfg, stats, act.title)
+    if cfg.download_external_files and not already_saved:
+        if target_host == base_host and "pluginfile.php" in target_url:
+            download_binary(ses, target_url, sec_dir, cfg, stats, preferred_name=act.title)
+        elif target_host and target_host != base_host:
+            _download_external_target_file(target_url, sec_dir, cfg, stats, act.title)
 
     collected_links.append(LinkItem(label=act.title, url=target_url, is_pluginfile=False))
     if cfg.save_url_files:
@@ -697,7 +805,19 @@ def handle_page_or_assign(
     write_text_file(_fit_windows_path(sec_dir, md_name), "\n".join(md_parts) + "\n", cfg, stats, kind="note")
 
     for pfile in pluginfiles:
-        download_binary(ses, pfile.url, sec_dir, cfg, stats)
+        try:
+            download_binary(ses, pfile.url, sec_dir, cfg, stats)
+        except PermissionError:
+            raise
+        except Exception as exc:
+            print(f"    [error] Attachment {pfile.url}: {exc}")
+            stats.errors += 1
+
+
+def _extract_chapter_id(url: str) -> str:
+    """Return `chapterid` query parameter from a book URL if present."""
+    ids = parse_qs(urlparse(url).query).get("chapterid")
+    return ids[0] if ids else ""
 
 
 def handle_book(
@@ -711,15 +831,35 @@ def handle_book(
     if not cfg.include_books:
         return
 
-    html, _ = fetch_html(ses, act.url)
-    chapters = parse_book_chapters(html, cfg.base_url, act.cmid)
+    html, final_url = fetch_html(ses, act.url)
+    chapters = parse_book_chapters(html, cfg.base_url, act.cmid, current_url=final_url)
     sections_md = [f"# {act.title}", f"\nSource: {act.url}\n"]
     seen_files: set[str] = set()
 
-    targets = chapters or [(act.title, act.url)]
+    current_chid = _extract_chapter_id(final_url) or _extract_chapter_id(act.url)
+    if chapters:
+        has_current = any(
+            ch_url in ("", act.url, final_url) or (current_chid and _extract_chapter_id(ch_url) == current_chid)
+            for _, ch_url in chapters
+        )
+        if not has_current:
+            chapters = [(act.title, final_url), *chapters]
+
+    targets = chapters or [(act.title, final_url)]
     for ch_title, ch_url in targets:
-        ch_html = html if ch_url == act.url else fetch_html(ses, ch_url)[0]
-        ch_text, pluginfiles, externals = parse_book_chapter_content(ch_html, cfg.base_url)
+        try:
+            if ch_url in ("", act.url, final_url) or (current_chid and _extract_chapter_id(ch_url) == current_chid):
+                ch_html = html
+            else:
+                ch_html = fetch_html(ses, ch_url)[0]
+            ch_text, pluginfiles, externals = parse_book_chapter_content(ch_html, cfg.base_url)
+        except PermissionError:
+            raise
+        except Exception as exc:
+            print(f"    [error] book chapter '{ch_title}': {exc}")
+            stats.errors += 1
+            continue
+
         sections_md.append(f"## {ch_title}\n\n{ch_text}")
         if externals:
             sections_md.append("\n".join(f"- [{l.label}]({l.url})" for l in externals))
@@ -727,7 +867,13 @@ def handle_book(
             key = pfile.url.split("?")[0]
             if key not in seen_files:
                 seen_files.add(key)
-                download_binary(ses, pfile.url, sec_dir, cfg, stats)
+                try:
+                    download_binary(ses, pfile.url, sec_dir, cfg, stats)
+                except PermissionError:
+                    raise
+                except Exception as exc:
+                    print(f"    [error] book attachment {pfile.url}: {exc}")
+                    stats.errors += 1
 
     md_name = sanitize_filename(f"book_{act.title}.md", max_length=100)
     write_text_file(_fit_windows_path(sec_dir, md_name), "\n\n".join(sections_md) + "\n", cfg, stats, kind="note")
@@ -742,6 +888,29 @@ def _dump_course_html(course_dir: Path, label: str, html: str, cfg: ScraperConfi
     stamp = dt.date.today().isoformat()
     out = dump_dir / sanitize_filename(f"{label}-{stamp}.html", max_length=120)
     out.write_text(html, encoding="utf-8")
+
+
+def _scrape_inline_folder(
+    ses: requests.Session,
+    inline_folder: InlineFolder,
+    sec_dir: Path,
+    cfg: ScraperConfig,
+    stats: ScrapeStats,
+) -> None:
+    """Download all files from an inline `mod_folder` rendered directly inside a course section."""
+    folder_dir = _fit_subdir_path(sec_dir, [inline_folder.title], reserved_filename_chars=55)
+    print(f"    +-- [folder] {folder_dir.name} ({len(inline_folder.files)} files)")
+    for rel_path, file_url in inline_folder.files:
+        parts = list(Path(rel_path).parts[:-1])
+        target_dir = _fit_subdir_path(folder_dir, parts)
+        fname = Path(rel_path).name
+        try:
+            download_binary(ses, file_url, target_dir, cfg, stats, preferred_name=fname, prefix="        ")
+        except PermissionError:
+            raise
+        except Exception as exc:
+            print(f"        [error] {fname}: {exc}")
+            stats.errors += 1
 
 
 def scrape_section(
@@ -761,9 +930,14 @@ def scrape_section(
     for pfile in section.embedded_files:
         try:
             download_binary(ses, pfile.url, sec_dir, cfg, stats)
+        except PermissionError:
+            raise
         except Exception as exc:
             print(f"    [error] Embedded file {pfile.url}: {exc}")
             stats.errors += 1
+
+    for inline_folder in section.inline_folders:
+        _scrape_inline_folder(ses, inline_folder, sec_dir, cfg, stats)
 
     dispatch: dict[str, Callable[[requests.Session, ActivityItem, Path, ScraperConfig, ScrapeStats], None]] = {
         "resource": handle_resource,
@@ -781,6 +955,8 @@ def scrape_section(
                 handle_url(ses, act, sec_dir, cfg, stats, section_links)
             else:
                 section_links.append(LinkItem(label=f"[{act.mod_type}] {act.title}", url=act.url, is_pluginfile=False))
+        except PermissionError:
+            raise
         except Exception as exc:
             print(f"    [error] {act.mod_type} '{act.title}': {exc}")
             stats.errors += 1
@@ -822,7 +998,14 @@ def scrape_course(
 
     subpages = find_subpage_section_urls(html, course.course_id, cfg.base_url)
     for sec_num, sub_url in subpages.items():
-        sub_html, _ = fetch_html(ses, sub_url)
+        try:
+            sub_html, _ = fetch_html(ses, sub_url)
+        except PermissionError:
+            raise
+        except Exception as exc:
+            print(f"  [error] Section {sec_num} ({sub_url}): {exc}")
+            stats.errors += 1
+            continue
         _dump_course_html(course_dir, f"course-{course.course_id}-sec-{sec_num}", sub_html, cfg)
         for sec in parse_course_sections(sub_html, cfg.base_url):
             if sec.section_num == sec_num or sec.section_num not in sections_by_num:
@@ -886,13 +1069,86 @@ def select_courses_interactive(courses: list[CourseInfo]) -> list[CourseInfo]:
     return selected
 
 
+def fetch_courses_via_ajax(ses: requests.Session, base_url: str, sesskey: str) -> list[CourseInfo]:
+    """Query Moodle 4.x enrolled courses via `lib/ajax/service.php` using `sesskey`."""
+    ajax_url = (
+        base_url.rstrip("/")
+        + "/lib/ajax/service.php?"
+        + urlencode(
+            {
+                "sesskey": sesskey,
+                "info": "core_course_get_enrolled_courses_by_timeline_classification",
+            }
+        )
+    )
+    payload = [
+        {
+            "index": 0,
+            "methodname": "core_course_get_enrolled_courses_by_timeline_classification",
+            "args": {
+                "offset": 0,
+                "limit": 0,
+                "classification": "all",
+                "sort": "fullname",
+                "customfieldname": "",
+                "customfieldvalue": "",
+            },
+        }
+    ]
+    try:
+        resp = ses.post(ajax_url, json=payload, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return parse_courses_from_ajax_payload(resp.json(), base_url)
+    except (requests.RequestException, ValueError):
+        return []
+
+
+def fetch_courses(ses: requests.Session, base_url: str) -> list[CourseInfo]:
+    """Discover enrolled courses via UFSC block, Moodle 4.x AJAX API, or `/my/courses.php`."""
+    dashboard_url = base_url.rstrip("/") + "/my/index.php?seeall=1"
+    html, _ = fetch_html(ses, dashboard_url)
+    if has_ufsc_course_list(html):
+        return parse_courses_from_dashboard(html, base_url)
+
+    sesskey = extract_sesskey(html)
+    if sesskey:
+        ajax_courses = fetch_courses_via_ajax(ses, base_url, sesskey)
+        if ajax_courses:
+            return ajax_courses
+
+    courses_page_url = base_url.rstrip("/") + "/my/courses.php"
+    try:
+        courses_html, _ = fetch_html(ses, courses_page_url)
+    except requests.RequestException:
+        courses_html = ""
+
+    if courses_html:
+        courses_sesskey = extract_sesskey(courses_html)
+        if courses_sesskey:
+            ajax_courses = fetch_courses_via_ajax(ses, base_url, courses_sesskey)
+            if ajax_courses:
+                return ajax_courses
+        parsed_courses = parse_courses_from_dashboard(courses_html, base_url)
+        if parsed_courses:
+            return parsed_courses
+
+    return parse_courses_from_dashboard(html, base_url)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Scrape UFSC Moodle courses and resources.")
+    parser = argparse.ArgumentParser(description="Scrape UFSC Moodle and Moodle 4.x courses and resources.")
     parser.add_argument("--conf", type=Path, default=Path("scraper.conf"), help="Path to scraper.conf")
+    parser.add_argument(
+        "--base-url",
+        help=f"Moodle base URL (overrides scraper.conf, default: {DEFAULT_BASE_URL})",
+    )
     parser.add_argument("--output", type=Path, help="Output root directory (overrides scraper.conf)")
-    parser.add_argument("--cookie", help="Session cookie (`VALUE` or `NAME=VALUE`, e.g. `MoodleSession=...`)")
-    parser.add_argument("--login", action="store_true", help="Open Chromium to log in via UFSC SSO")
+    parser.add_argument(
+        "--cookie",
+        help="Session cookie (`VALUE` or `NAME=VALUE`, e.g. `MoodleSessionmdlpre=...`)",
+    )
+    parser.add_argument("--login", action="store_true", help="Open Chromium to log in via SSO / Moodle")
     parser.add_argument("--list", action="store_true", help="List semesters and courses, then exit")
     parser.add_argument("--all", action="store_true", help="Scrape all enrolled courses across all semesters")
     parser.add_argument("--semester", action="append", default=[], help="Filter semester (e.g. '2026 - 2')")
@@ -904,7 +1160,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point for UFSC MoodleScraper CLI."""
+    """Entry point for MoodleScraper CLI."""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     if hasattr(sys.stderr, "reconfigure"):
@@ -912,6 +1168,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     cfg = load_config(args.conf)
 
+    if args.base_url:
+        cfg.base_url = args.base_url.strip().rstrip("/") + "/"
     if args.output:
         cfg.root = args.output
     if args.cookie:
@@ -929,9 +1187,8 @@ def main(argv: list[str] | None = None) -> int:
 
     ses = build_http_session(cfg.base_url, cfg.moodle_session)
 
-    dashboard_url = cfg.base_url.rstrip("/") + "/my/index.php?seeall=1"
     try:
-        html, _ = fetch_html(ses, dashboard_url)
+        courses = fetch_courses(ses, cfg.base_url)
     except PermissionError as exc:
         print(f"[auth] {exc}", file=sys.stderr)
         print(
@@ -941,7 +1198,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    courses = parse_courses_from_dashboard(html, cfg.base_url)
     if not courses:
         print("No courses found on dashboard.", file=sys.stderr)
         return 1
@@ -968,12 +1224,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     stats = ScrapeStats()
-    for course in selected:
-        try:
-            scrape_course(ses, course, cfg, stats)
-        except Exception as exc:
-            print(f"[error] Failed course {course.course_id} ({course.title}): {exc}")
-            stats.errors += 1
+    try:
+        for course in selected:
+            try:
+                scrape_course(ses, course, cfg, stats)
+            except PermissionError:
+                raise
+            except Exception as exc:
+                print(f"[error] Failed course {course.course_id} ({course.title}): {exc}")
+                stats.errors += 1
+    except PermissionError as exc:
+        print(f"[auth] {exc}", file=sys.stderr)
+        print(
+            "[hint] Session expired mid-run. Re-run with `--login` or a fresh `--cookie <MoodleSessionmdlpre>`.",
+            file=sys.stderr,
+        )
+        return 1
 
     print(
         f"\nDone! saved={stats.saved}, skipped={stats.skipped}, "

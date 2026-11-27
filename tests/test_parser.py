@@ -7,11 +7,14 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from moodle_parser import (
+    extract_sesskey,
     filename_from_headers_or_url,
     find_subpage_section_urls,
+    has_ufsc_course_list,
     is_login_page,
     parse_book_chapter_content,
     parse_book_chapters,
+    parse_courses_from_ajax_payload,
     parse_courses_from_dashboard,
     parse_course_sections,
     parse_folder_files,
@@ -89,6 +92,55 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual((courses[1].course_id, courses[1].semester), ("50035", "2026 - 2"))
         self.assertEqual((courses[2].course_id, courses[2].semester), ("24237", "2025 - 1"))
         self.assertEqual((courses[3].course_id, courses[3].semester), ("18328", "Outros"))
+
+    def test_extracts_sesskey_ufsc_detection_and_ajax_course_payload(self) -> None:
+        boost_html = """
+        <html><body>
+          <script>M.cfg = {"wwwroot":"https://moodle.example.edu","sesskey":"abcXYZ_123"};</script>
+          <div class="usermenu"><a href="/login/logout.php?sesskey=fallback99">Log out</a></div>
+        </body></html>
+        """
+        self.assertFalse(has_ufsc_course_list(boost_html))
+        self.assertEqual(extract_sesskey(boost_html), "abcXYZ_123")
+        self.assertEqual(
+            extract_sesskey('<form><input type="hidden" name="sesskey" value="formTok7"></form>'),
+            "formTok7",
+        )
+        self.assertEqual(
+            extract_sesskey('<a href="/login/logout.php?sesskey=linkTok8">Logout</a>'),
+            "linkTok8",
+        )
+
+        payload = [
+            {
+                "error": False,
+                "data": {
+                    "courses": [
+                        {
+                            "id": 701,
+                            "fullname": "Introduction to Political Science",
+                            "shortname": "POL101",
+                            "viewurl": "https://moodle.example.edu/course/view.php?id=701",
+                            "coursecategory": "Fall 2026",
+                        },
+                        {
+                            "id": 701,
+                            "fullname": "Duplicate",
+                        },
+                    ]
+                },
+            }
+        ]
+        courses = parse_courses_from_ajax_payload(payload, "https://moodle.example.edu/")
+        self.assertEqual(len(courses), 1)
+        self.assertEqual(courses[0].course_id, "701")
+        self.assertEqual(courses[0].title, "Introduction to Political Science")
+        self.assertEqual(courses[0].short_code, "POL101")
+        self.assertEqual(courses[0].semester, "Fall 2026")
+        self.assertEqual(
+            parse_courses_from_ajax_payload([{"error": True, "data": {}}], "https://moodle.example.edu/"),
+            [],
+        )
 
 
 class CourseParsingTests(unittest.TestCase):
@@ -393,6 +445,133 @@ class CourseParsingTests(unittest.TestCase):
         """
         text, _, _ = parse_book_chapter_content(html, BASE_URL)
         self.assertEqual(text, "Texto exclusivo do capitulo 1.")
+
+    def test_cleans_double_dot_and_trailing_space_filename_stems(self) -> None:
+        self.assertEqual(
+            sanitize_filename("DORATIOTO, F. (2000). A politica platina..pdf"),
+            "DORATIOTO, F. (2000). A politica platina.pdf",
+        )
+        self.assertEqual(
+            sanitize_filename("Cap1 - Guerra paraguai. .pdf"),
+            "Cap1 - Guerra paraguai.pdf",
+        )
+
+    def test_parse_book_chapters_keeps_active_strong_chapter_and_exact_cmid(self) -> None:
+        book_html = """
+        <html><body>
+          <aside class="block_book_toc">
+            <ul>
+              <li>
+                <strong>1. Capitulo Ativo</strong>
+                <ul>
+                  <li><a href="/mod/book/view.php?id=30&amp;chapterid=102">1.1 Subcapitulo</a></li>
+                </ul>
+              </li>
+              <li><a href="/mod/book/view.php?id=30&amp;chapterid=103">2. Conclusao</a></li>
+              <li><a href="/mod/book/view.php?id=301&amp;chapterid=30">Outro Livro</a></li>
+            </ul>
+          </aside>
+        </body></html>
+        """
+        current_url = "https://presencial.moodle.ufsc.br/mod/book/view.php?id=30&chapterid=101"
+        chapters = parse_book_chapters(book_html, BASE_URL, "30", current_url=current_url)
+        self.assertEqual(
+            chapters,
+            [
+                ("1. Capitulo Ativo", current_url),
+                ("1.1 Subcapitulo", "https://presencial.moodle.ufsc.br/mod/book/view.php?id=30&chapterid=102"),
+                ("2. Conclusao", "https://presencial.moodle.ufsc.br/mod/book/view.php?id=30&chapterid=103"),
+            ],
+        )
+
+    def test_nested_descriptions_not_duplicated_and_inline_folder_parsed(self) -> None:
+        html = """
+        <html><body><div role="main"><div class="course-content"><ul class="topics">
+          <li id="section-1" class="section course-section main">
+            <h3 class="sectionname">Semana 1</h3>
+            <div class="content"><ul class="section">
+              <li id="module-10" class="activity modtype_assign">
+                <a class="aalink" href="/mod/assign/view.php?id=10">
+                  <span class="instancename">Tarefa 1</span>
+                </a>
+                <div class="description">
+                  <div class="activity-altcontent"><p>Ler texto obrigatorio.</p></div>
+                </div>
+              </li>
+              <li id="module-11" class="activity modtype_folder">
+                <span class="instancename">Pasta Inline<span class="accesshide"> Pasta</span></span>
+                <div class="foldertree">
+                  <a href="/pluginfile.php/55/mod_folder/content/0/Sub/Leitura.pdf">Leitura.pdf</a>
+                </div>
+              </li>
+            </ul></div>
+          </li>
+        </ul></div></div></body></html>
+        """
+        sections = parse_course_sections(html, BASE_URL)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0].summary_text.count("Ler texto obrigatorio."), 1)
+        self.assertEqual(sections[0].embedded_files, [])
+        self.assertEqual(len(sections[0].inline_folders), 1)
+        self.assertEqual(sections[0].inline_folders[0].title, "Pasta Inline")
+        self.assertEqual(
+            sections[0].inline_folders[0].files,
+            [("Sub/Leitura.pdf", "https://presencial.moodle.ufsc.br/pluginfile.php/55/mod_folder/content/0/Sub/Leitura.pdf")],
+        )
+
+    def test_subpages_reordered_params_and_moodle44_section_php(self) -> None:
+        html = """
+        <html><body><div role="main"><div class="course-content"><ul class="topics">
+          <li id="section-0" class="section course-section main">
+            <li id="module-1" class="activity modtype_forum"></li>
+          </li>
+          <li id="section-2" class="section course-section main section-summary">
+            <a href="/course/view.php?section=2&amp;id=50017">Unidade 2</a>
+          </li>
+          <li id="section-3" class="section course-section main section-summary">
+            <a href="/course/section.php?id=99988#top">Unidade 3</a>
+          </li>
+        </ul></div></div></body></html>
+        """
+        subpages = find_subpage_section_urls(html, "50017", BASE_URL)
+        self.assertEqual(
+            subpages,
+            {
+                2: "https://presencial.moodle.ufsc.br/course/view.php?section=2&id=50017",
+                3: "https://presencial.moodle.ufsc.br/course/section.php?id=99988",
+            },
+        )
+
+    def test_resource_redirect_embedded_media_url_iframe_and_mime_extension(self) -> None:
+        res_html = """
+        <html><body><div role="main">
+          <img src="/pluginfile.php/1/user/icon/f1">
+          <div class="resourcecontent">
+            <img src="/pluginfile.php/88/mod_resource/content/1/Mapa.png">
+          </div>
+        </div></body></html>
+        """
+        self.assertEqual(
+            parse_resource_redirect_url(res_html, BASE_URL),
+            "https://presencial.moodle.ufsc.br/pluginfile.php/88/mod_resource/content/1/Mapa.png",
+        )
+
+        url_html = """
+        <html><body><div role="main">
+          <div class="resourcecontent">
+            <iframe id="resourceobject" src="https://example.org/embed/doc.pdf"></iframe>
+          </div>
+        </div></body></html>
+        """
+        self.assertEqual(parse_url_activity_target(url_html, BASE_URL), "https://example.org/embed/doc.pdf")
+
+        self.assertEqual(
+            filename_from_headers_or_url(
+                {"Content-Type": "application/pdf; charset=binary"},
+                "https://example.org/download?id=42",
+            ),
+            "download.pdf",
+        )
 
 
 if __name__ == "__main__":

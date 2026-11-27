@@ -415,6 +415,346 @@ class EndToEndLoopbackMoodleTests(unittest.TestCase):
             ext_server.shutdown()
             ext_server.server_close()
 
+    def test_ufsc_bare_cookie_sets_moodle_session_mdlpre(self) -> None:
+        ses = build_http_session("https://presencial.moodle.ufsc.br/", "raw-token-xyz")
+        cookies = ses.cookies.get_dict()
+        self.assertEqual(cookies.get("MoodleSession"), "raw-token-xyz")
+        self.assertEqual(cookies.get("MoodleSessionmdlpre"), "raw-token-xyz")
+
+    def test_auth_expiry_book_active_chapter_duplicates_folder_resilience_and_inline_folder(self) -> None:
+        mode = {"expire_on_url": False, "expire_on_pdf": False}
+
+        class EdgeCaseHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:
+                return
+
+            def _send(self, status: int, body: bytes, ctype: str, headers: dict[str, str] | None = None) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                if headers:
+                    for k, v in headers.items():
+                        self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                host_hdr = self.headers.get("Host", "127.0.0.1")
+
+                if parsed.path == "/my/index.php":
+                    html = f"""
+                    <html><body>
+                      <div class="usermenu"><a href="/login/logout.php">Sair</a></div>
+                      <section class="block_ufsc_course_list"><div class="content">
+                        2026 - 2
+                        <div><a href="http://{host_hdr}/course/view.php?id=60001">Curso Edge</a></div>
+                      </div></section>
+                    </body></html>
+                    """.encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/course/view.php" and qs.get("id") == ["60001"]:
+                    html = """
+                    <html><body><div role="main"><div class="course-content"><ul class="topics">
+                      <li id="section-0" class="section course-section main">
+                        <h3 class="sectionname">Geral</h3>
+                        <div class="content"><ul class="section">
+                          <li id="module-1" class="activity modtype_book">
+                            <a class="aalink" href="/mod/book/view.php?id=1"><span class="instancename">Livro Ativo</span></a>
+                          </li>
+                          <li id="module-2" class="activity modtype_url">
+                            <a class="aalink" href="/mod/url/view.php?id=2"><span class="instancename">Link Repetido</span></a>
+                          </li>
+                          <li id="module-3" class="activity modtype_url">
+                            <a class="aalink" href="/mod/url/view.php?id=3"><span class="instancename">Link Repetido</span></a>
+                          </li>
+                          <li id="module-4" class="activity modtype_page">
+                            <a class="aalink" href="/mod/page/view.php?id=4"><span class="instancename">Nota</span></a>
+                          </li>
+                          <li id="module-5" class="activity modtype_page">
+                            <a class="aalink" href="/mod/page/view.php?id=5"><span class="instancename">Nota</span></a>
+                          </li>
+                          <li id="module-6" class="activity modtype_folder">
+                            <a class="aalink" href="/mod/folder/view.php?id=6"><span class="instancename">Pasta Parcial</span></a>
+                          </li>
+                          <li id="module-7" class="activity modtype_folder">
+                            <span class="instancename">Pasta Inline</span>
+                            <div class="foldertree">
+                              <a href="/pluginfile.php/700/mod_folder/content/0/Nested/InlineDoc.pdf">InlineDoc.pdf</a>
+                            </div>
+                          </li>
+                        </ul></div>
+                      </li>
+                    </ul></div></div></body></html>
+                    """.encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/mod/book/view.php":
+                    chid = qs.get("chapterid", ["10"])[0]
+                    if chid == "10":
+                        html = """
+                        <html><body>
+                          <aside class="block_book_toc"><ul>
+                            <li><strong>1. Primeiro Capitulo</strong></li>
+                            <li><a href="/mod/book/view.php?id=1&amp;chapterid=20">2. Segundo Capitulo</a></li>
+                          </ul></aside>
+                          <div class="book_content"><p>Texto do primeiro capitulo</p></div>
+                        </body></html>
+                        """.encode("utf-8")
+                    else:
+                        html = """
+                        <html><body>
+                          <aside class="block_book_toc"><ul>
+                            <li><a href="/mod/book/view.php?id=1&amp;chapterid=10">1. Primeiro Capitulo</a></li>
+                            <li><strong>2. Segundo Capitulo</strong></li>
+                          </ul></aside>
+                          <div class="book_content"><p>Texto do segundo capitulo</p></div>
+                        </body></html>
+                        """.encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/mod/url/view.php":
+                    if mode["expire_on_url"]:
+                        self.send_response(302)
+                        self.send_header("Location", "https://sistemas.ufsc.br/login?service=moodle")
+                        self.end_headers()
+                        return
+                    uid = qs.get("id", ["2"])[0]
+                    html = f"""
+                    <html><body><div role="main">
+                      <div class="urlworkaround"><a href="https://example.invalid/item-{uid}">ir</a></div>
+                    </div></body></html>
+                    """.encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/mod/page/view.php":
+                    pid = qs.get("id", ["4"])[0]
+                    html = f"<html><body><div role='main'><p>Conteudo pagina {pid}</p></div></body></html>".encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/mod/folder/view.php":
+                    html = """
+                    <html><body><section id="region-main"><div role="main"><div class="foldertree">
+                      <a href="/pluginfile.php/600/mod_folder/content/0/Quebrado.pdf">Quebrado.pdf</a>
+                      <a href="/pluginfile.php/600/mod_folder/content/0/Bom.pdf">Bom.pdf</a>
+                    </div></div></section></body></html>
+                    """.encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/pluginfile.php/600/mod_folder/content/0/Quebrado.pdf":
+                    self._send(404, b"Missing", "text/plain")
+                    return
+
+                if parsed.path == "/pluginfile.php/600/mod_folder/content/0/Bom.pdf":
+                    if mode["expire_on_pdf"]:
+                        guest_html = (
+                            b'<div class="logininfo">Visitante (<a href="/login/index.php">Acessar</a>)</div>'
+                        )
+                        self._send(200, guest_html, "text/html; charset=utf-8")
+                        return
+                    self._send(200, b"%PDF-1.4\n%Bom", "application/pdf")
+                    return
+
+                if parsed.path == "/pluginfile.php/700/mod_folder/content/0/Nested/InlineDoc.pdf":
+                    self._send(200, b"%PDF-1.4\n%Inline", "application/pdf")
+                    return
+
+                self._send(404, b"Not found", "text/plain")
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), EdgeCaseHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                conf_path = root / "scraper.conf"
+                out_dir = root / "downloads"
+                conf_path.write_text(
+                    f"[scraper]\nbaseurl = http://127.0.0.1:{server.server_port}/\n"
+                    f"root = {out_dir}\ndownload_external_files = false\n",
+                    encoding="utf-8",
+                )
+
+                # 1. Partial folder failure still downloads remaining files, preserves book ch1, disambiguates duplicates, and downloads inline folder.
+                rc = main(["--conf", str(conf_path), "--cookie", "MoodleSession=ok", "--all"])
+                self.assertEqual(rc, 2)
+                sec0 = out_dir / "2026 - 2" / "Curso Edge" / "00 - Geral"
+                book_md = (sec0 / "book_Livro Ativo.md").read_text(encoding="utf-8")
+                self.assertIn("Texto do primeiro capitulo", book_md)
+                self.assertIn("Texto do segundo capitulo", book_md)
+                self.assertTrue((sec0 / "Link Repetido.url").is_file())
+                self.assertTrue((sec0 / "Link Repetido (2).url").is_file())
+                self.assertTrue((sec0 / "page_Nota.md").is_file())
+                self.assertTrue((sec0 / "page_Nota (2).md").is_file())
+                self.assertTrue((sec0 / "Pasta Parcial" / "Bom.pdf").is_file())
+                self.assertFalse((sec0 / "Pasta Parcial" / "Quebrado.pdf").exists())
+                self.assertTrue((sec0 / "Pasta Inline" / "Nested" / "InlineDoc.pdf").is_file())
+
+                # 2. Cross-host redirect to sistemas.ufsc.br in mod_url aborts cleanly with exit code 1.
+                mode["expire_on_url"] = True
+                out_dir_2 = root / "downloads_sso"
+                rc_sso = main(
+                    ["--conf", str(conf_path), "--output", str(out_dir_2), "--cookie", "MoodleSession=ok", "--all"]
+                )
+                self.assertEqual(rc_sso, 1)
+                self.assertFalse((out_dir_2 / "2026 - 2" / "Curso Edge" / "00 - Geral" / "Link Repetido.url").exists())
+
+                # 3. 200 OK HTML guest/login page returned for a PDF raises PermissionError and is not saved.
+                mode["expire_on_url"] = False
+                mode["expire_on_pdf"] = True
+                out_dir_3 = root / "downloads_guest"
+                rc_guest = main(
+                    ["--conf", str(conf_path), "--output", str(out_dir_3), "--cookie", "MoodleSession=ok", "--all"]
+                )
+                self.assertEqual(rc_guest, 1)
+                self.assertFalse((out_dir_3 / "2026 - 2" / "Curso Edge" / "00 - Geral" / "Pasta Parcial" / "Bom.pdf").exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_generic_moodle4_ajax_course_discovery_with_base_url_cli(self) -> None:
+        ajax_calls: list[str] = []
+
+        class GenericBoostHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:
+                return
+
+            def _send(self, status: int, body: bytes, ctype: str) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                host_hdr = self.headers.get("Host", "127.0.0.1")
+
+                if parsed.path == "/my/index.php":
+                    html = """
+                    <html><body>
+                      <div class="usermenu"><a href="/login/logout.php?sesskey=boostSess99">Log out</a></div>
+                      <script>M.cfg = {"sesskey":"boostSess99"};</script>
+                      <div role="main"><div class="block_myoverview">Loading...</div></div>
+                    </body></html>
+                    """.encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/course/view.php" and qs.get("id") == ["8080"]:
+                    html = f"""
+                    <html><body><div role="main"><div class="course-content"><ul class="topics">
+                      <li id="section-0" class="section course-section main">
+                        <h3 class="sectionname">General</h3>
+                        <div class="content"><ul class="section">
+                          <li id="module-15" class="activity modtype_resource">
+                            <a class="aalink" href="http://{host_hdr}/mod/resource/view.php?id=15">
+                              <span class="instancename">Syllabus</span>
+                            </a>
+                          </li>
+                        </ul></div>
+                      </li>
+                    </ul></div></div></body></html>
+                    """.encode("utf-8")
+                    self._send(200, html, "text/html; charset=utf-8")
+                    return
+
+                if parsed.path == "/mod/resource/view.php":
+                    self.send_response(302)
+                    self.send_header("Location", "/pluginfile.php/8080/mod_resource/content/1/syllabus.pdf")
+                    self.end_headers()
+                    return
+
+                if parsed.path == "/pluginfile.php/8080/mod_resource/content/1/syllabus.pdf":
+                    self._send(200, b"%PDF-1.4\n%GenericBoost", "application/pdf")
+                    return
+
+                self._send(404, b"Not found", "text/plain")
+
+            def do_POST(self) -> None:
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                if parsed.path == "/lib/ajax/service.php" and qs.get("sesskey") == ["boostSess99"]:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    raw_body = self.rfile.read(length).decode("utf-8")
+                    ajax_calls.append(raw_body)
+                    host_hdr = self.headers.get("Host", "127.0.0.1")
+                    resp_payload = json.dumps(
+                        [
+                            {
+                                "error": False,
+                                "data": {
+                                    "courses": [
+                                        {
+                                            "id": 8080,
+                                            "fullname": "CS101 - Algorithms",
+                                            "shortname": "CS101",
+                                            "viewurl": f"http://{host_hdr}/course/view.php?id=8080",
+                                            "coursecategory": "Computer Science",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    ).encode("utf-8")
+                    self._send(200, resp_payload, "application/json")
+                    return
+                self._send(404, b"Not found", "text/plain")
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), GenericBoostHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                missing_conf = root / "nonexistent.conf"
+                out_dir = root / "downloads"
+
+                rc_list = main(
+                    [
+                        "--conf",
+                        str(missing_conf),
+                        "--base-url",
+                        base_url,
+                        "--cookie",
+                        "MoodleSession=generic-tok",
+                        "--list",
+                    ]
+                )
+                self.assertEqual(rc_list, 0)
+
+                rc_all = main(
+                    [
+                        "--conf",
+                        str(missing_conf),
+                        "--base-url",
+                        base_url,
+                        "--output",
+                        str(out_dir),
+                        "--cookie",
+                        "MoodleSession=generic-tok",
+                        "--all",
+                    ]
+                )
+                self.assertEqual(rc_all, 0)
+                self.assertGreaterEqual(len(ajax_calls), 2)
+                self.assertTrue(
+                    (out_dir / "Computer Science" / "CS101 - Algorithms" / "00 - General" / "Syllabus.pdf").is_file()
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

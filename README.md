@@ -1,6 +1,6 @@
 # UFSC MoodleScraper
 
-Python 3 scraper for UFSC Moodle (`https://presencial.moodle.ufsc.br/`), inspired by [`doebi/MoodleScraper`](https://github.com/doebi/MoodleScraper) and built for Moodle 4.x Classic + UFSC SSO (`idUFSC`) + `blocks/ufsc_course_list`.
+Python 3 scraper built for UFSC Moodle (`https://presencial.moodle.ufsc.br/`) and compatible with **any Moodle 4.x instance** (via `--base-url`), inspired by [`doebi/MoodleScraper`](https://github.com/doebi/MoodleScraper). Supports SSO login via Playwright, standard Moodle 4.x Boost AJAX course discovery, and UFSC `blocks/ufsc_course_list`.
 
 ## Folder Layout
 
@@ -18,8 +18,8 @@ downloads/
 
 ## Features
 
-- Parses all semesters and courses from `/my/index.php?seeall=1` (`blocks/ufsc_course_list`).
-- Handles both inline topic/week courses and one-section-per-page courses (`coursedisplay = 1`, `&section=N`).
+- Discovers semesters and courses from UFSC `/my/index.php?seeall=1` (`blocks/ufsc_course_list`) or from standard Moodle 4.x instances via `lib/ajax/service.php` (`core_course_get_enrolled_courses_by_timeline_classification`) and `/my/courses.php`.
+- Handles both inline topic/week courses and one-section-per-page courses (`coursedisplay = 1`, `&section=N` and Moodle 4.4+ `section.php`).
 - Downloads & extracts:
   - `mod_resource` files (direct redirects and HTML wrapper pages), preserving extensions cleanly even when activity titles contain dots (e.g. `2026.1`, `J. Nabuco`)
   - `mod_folder` trees (preserving internal subfolders safely within Windows `MAX_PATH`) plus folder descriptions as `info.md`
@@ -39,26 +39,29 @@ pip install -r requirements.txt
 
 ## Authentication & Usage
 
-### Option 1: Interactive UFSC SSO Login (Playwright)
+### Option 1: Interactive SSO Login (Playwright)
 
-Opens a browser window at `/login/index.php` so you can sign in via `idUFSC`; cookies are saved locally in `.session/cookies.json`:
+Opens a browser window at `/login/index.php` so you can sign in via SSO (e.g. `idUFSC`, SAML, CAS, or standard Moodle login); cookies are saved locally in `.session/cookies.json`:
 
 ```bash
 python scraper.py --login --list
 python scraper.py --semester "2026 - 2"
 python scraper.py --all
+
+# Any other Moodle 4.x site:
+python scraper.py --base-url "https://moodle.example.edu" --login --all
 ```
 
-### Option 2: Reuse Your Open Chrome `MoodleSession` Cookie
+### Option 2: Reuse Your Open Chrome Session Cookie (`MoodleSessionmdlpre`)
 
-Copy the `MoodleSession` (or `MoodleSessionpresencial`) cookie value—or full `Cookie:` header—from Chrome DevTools (`Application -> Cookies -> https://presencial.moodle.ufsc.br`), then run:
+Copy the `MoodleSessionmdlpre` (or `MoodleSession`) cookie value—or full `Cookie:` header—from Chrome DevTools (`Application -> Cookies -> https://presencial.moodle.ufsc.br`), then run:
 
 ```bash
-python scraper.py --cookie "YOUR_MOODLE_SESSION" --list
-python scraper.py --cookie "MoodleSessionpresencial=..." --semester "2026 - 2"
+python scraper.py --cookie "YOUR_COOKIE_VALUE" --list
+python scraper.py --cookie "MoodleSessionmdlpre=..." --semester "2026 - 2"
 ```
 
-Or copy `scraper.conf.sample` to `scraper.conf` (or set `MOODLE_SESSION` in your environment).
+Or copy `scraper.conf.sample` to `scraper.conf` (or set `MOODLE_SESSION` in your environment). Passing a bare cookie value automatically sends both `MoodleSession` and `MoodleSessionmdlpre` for `presencial.moodle.ufsc.br`.
 
 ### Interactive Mode (like `doebi/MoodleScraper`)
 
@@ -68,8 +71,9 @@ python scraper.py
 
 ### Useful Flags
 
-- `--list`: List semesters and courses without downloading.
-- `--semester "2026 - 2"`: Scrape a specific semester (repeatable).
+- `--base-url URL`: Moodle base URL (overrides `scraper.conf`, defaults to `https://presencial.moodle.ufsc.br/`).
+- `--list`: List semesters/categories and courses without downloading.
+- `--semester "2026 - 2"`: Scrape a specific semester or course category (repeatable).
 - `--course-id 50035`: Scrape a specific course ID (repeatable).
 - `--all`: Scrape all enrolled courses.
 - `--overwrite`: Redownload existing files.
@@ -82,4 +86,8 @@ python scraper.py
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
 
